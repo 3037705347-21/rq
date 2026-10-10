@@ -218,6 +218,112 @@ Example:
 $ rq cron myapp.cron_config --url redis://localhost:6379/1 --path src
 ```
 
+## Declarative Cron Plans
+
+__New in version 3.0.__
+
+While configuration files describe what a single scheduler process should run,
+a **cron plan** is a reviewable, version-controlled manifest of the cron jobs
+that should be live in an environment. Releasing means reconciling the plan
+against the jobs currently defined in Redis:
+
+- jobs added to the plan start running;
+- jobs whose definition changed are updated;
+- jobs removed from the plan are deactivated (they stop being scheduled);
+- jobs outside the plan are always left untouched — including jobs registered
+  directly with a running scheduler and jobs owned by other plan IDs.
+
+Reconciliation is **all-or-nothing**: if the plan contains an invalid cron
+expression, a non-positive interval, or duplicate job names, every problem is
+reported and the live state is not modified at all. Applying the same plan
+twice converges to identical state — the second apply reports everything as
+unchanged and performs no writes.
+
+### Writing a Plan
+
+Plan files are Python files just like cron configuration files, but use
+`define()`:
+
+```python
+# cron_plan.py
+from rq.cron_plan import define
+from myapp.tasks import cleanup_temp_files, send_newsletter
+
+# Clean up temporary files every 30 minutes
+define(
+    cleanup_temp_files,
+    queue_name='maintenance',
+    interval=1800,
+    name='cleanup-temp-files',
+)
+
+# Send newsletter every Tuesday at 10:30 AM
+define(
+    send_newsletter,
+    queue_name='email',
+    args=('weekly_digest',),
+    kwargs={'template': 'newsletter.html'},
+    cron='30 10 * * 2',
+)
+```
+
+The `name` uniquely identifies a job within the plan; omit it to default to the
+function's dotted path. Renaming a job is interpreted as removing the old name
+and adding the new one. `args`, `kwargs` and `meta` must be JSON serializable.
+
+### Applying a Plan (per release)
+
+```console
+$ rq cron-plan apply cron_plan.py --url redis://localhost:6379/0
+Cron plan 'default': 1 added, 0 changed, 1 removed, 4 unchanged.
+  + cleanup-temp-files
+  - old-nightly-job
+```
+
+Use `--plan-id` to keep several independent sets of managed jobs apart (for
+example one per team). Reconciliation only ever touches the namespace it is
+applying to:
+
+```console
+$ rq cron-plan apply cron_plan.py --plan-id billing
+```
+
+### Running Plan-Mode Schedulers
+
+A scheduler runs the managed jobs of a plan with `--plan-id`; it keeps the
+plan's jobs in sync on every loop, so adds, changes and removals take effect
+without restarting the process:
+
+```console
+$ rq cron --plan-id default
+```
+
+You can combine a plan with directly registered jobs from a configuration file;
+those ad-hoc jobs survive every plan refresh:
+
+```console
+$ rq cron --plan-id default extra_cron_config.py
+```
+
+Removing a job from the plan stops future runs; its job history is not deleted
+and expires according to the existing history TTL.
+
+### Programmatic API
+
+```python
+from redis import Redis
+from rq.cron_plan import CronPlan, reconcile
+
+connection = Redis()
+plan = CronPlan.load('myapp.cron_plan')
+result = reconcile(plan, connection, plan_id='default')
+print(result.summary())
+# result.added / .changed / .removed / .unchanged list the affected job names
+```
+
+An invalid plan raises `rq.exceptions.InvalidCronPlanError`, whose `.errors`
+lists every problem found; no state is changed.
+
 ## Programmatic API
 
 ### Basic Usage

@@ -292,9 +292,14 @@ class CronScheduler:
         connection: Redis,
         logging_level: str | int = logging.INFO,
         name: str = '',
+        plan_id: str | None = None,
     ):
         self.connection: Redis = connection
         self._cron_jobs: list[CronJob] = []
+        # Jobs owned by a reconciled cron plan. Kept in a separate slot from
+        # directly registered jobs so refreshes never touch ad-hoc jobs.
+        self._managed_cron_jobs: list[CronJob] = []
+        self.plan_id: str | None = plan_id
         self.hostname: str = socket.gethostname()
         self.pid: int = os.getpid()
         self.name: str = name or f'{self.hostname}:{self.pid}:{uuid.uuid4().hex[:6]}'
@@ -365,14 +370,70 @@ class CronScheduler:
         return cron_job
 
     def get_jobs(self) -> list[CronJob]:
-        """Get all registered cron jobs"""
-        return self._cron_jobs
+        """Get all jobs this scheduler enqueues: ad-hoc registrations plus plan-managed jobs"""
+        return self._cron_jobs + self._managed_cron_jobs
+
+    def load_managed_jobs(self, plan_id: str | None = None) -> list[CronJob]:
+        """Load the cron jobs owned by a plan from its managed definitions in Redis.
+
+        Same-named jobs already held by this scheduler keep their
+        `latest_enqueue_time`, so refreshing the plan (e.g. after a schedule
+        change) does not reset an existing job's cadence.
+
+        Raises if the scheduler has no plan_id, the stored data is corrupt, or a
+        referenced function cannot be imported; callers can catch this and keep
+        the previously loaded job set.
+        """
+        from . import cron_plan_registry
+        from .cron_plan import CronDefinition
+
+        plan_id = plan_id or self.plan_id
+        if plan_id is None:
+            raise ValueError('No plan_id configured for this CronScheduler')
+
+        previous = {job.name: job for job in self._managed_cron_jobs}
+        jobs: list[CronJob] = []
+        for raw_value in cron_plan_registry.get_definitions(self.connection, plan_id).values():
+            definition = CronDefinition.from_dict(cron_plan_registry.parse_definition(raw_value))
+            cron_job = definition.to_cron_job()
+            previous_job = previous.get(definition.name)
+            if previous_job is not None and previous_job.latest_enqueue_time is not None:
+                cron_job.set_enqueue_time(previous_job.latest_enqueue_time)
+            jobs.append(cron_job)
+        return jobs
+
+    def refresh_managed_jobs(self) -> bool:
+        """Refresh plan-managed jobs from Redis, keeping the old set on failure.
+
+        Returns True when the managed job set was replaced, False when plan mode
+        is disabled or loading failed (in which case the previous set is kept).
+        """
+        if self.plan_id is None:
+            return False
+        try:
+            jobs = self.load_managed_jobs()
+        except Exception as e:
+            self.log.warning(
+                'CronScheduler %s: failed to refresh managed cron jobs from plan %r, keeping previous set: %s',
+                self.name,
+                self.plan_id,
+                e,
+            )
+            return False
+        self._managed_cron_jobs = jobs
+        self.log.debug(
+            'CronScheduler %s: refreshed %d managed cron jobs from plan %r',
+            self.name,
+            len(jobs),
+            self.plan_id,
+        )
+        return True
 
     def enqueue_jobs(self) -> list[CronJob]:
         """Enqueue all jobs that are due to run"""
         enqueue_time = now()
         enqueued_jobs: list[CronJob] = []
-        for job in self._cron_jobs:
+        for job in self.get_jobs():
             if job.should_run():
                 job.enqueue(self.connection)
                 job.set_enqueue_time(enqueue_time)
@@ -387,8 +448,8 @@ class CronScheduler:
         """
         current_time = now()
 
-        # Find the next job to run
-        next_job_times = [job.next_enqueue_time for job in self._cron_jobs if job.next_enqueue_time]
+        # Find the next job to run (covers both ad-hoc and plan-managed jobs)
+        next_job_times = [job.next_enqueue_time for job in self.get_jobs() if job.next_enqueue_time]
 
         if not next_job_times:
             return 60  # Default sleep time of 60 seconds
@@ -426,6 +487,9 @@ class CronScheduler:
 
         try:
             while True:
+                # Pick up plan additions/changes/removes before deciding what is due.
+                # Failures keep the previous job set and are logged inside.
+                self.refresh_managed_jobs()
                 enqueued_jobs = self.enqueue_jobs()
                 if enqueued_jobs:
                     # Persist updated job timing data to Redis
@@ -463,52 +527,7 @@ class CronScheduler:
         global _job_data_registry
         _job_data_registry = []  # Clear global registry before loading module
 
-        if os.path.isabs(config_path):
-            # Absolute paths must be loaded by file path (cannot be converted to valid module paths)
-            self.log.debug(f'Loading absolute file path: {config_path}')
-
-            # Validate the file path
-            validate_absolute_path(config_path)
-
-            # Load the file as a module
-            module_name = f'rq_cron_config_{os.path.basename(config_path).replace(".", "_")}'
-            try:
-                spec = importlib.util.spec_from_file_location(module_name, config_path)
-                if spec is None or spec.loader is None:
-                    error_msg = f'Could not create module spec for {config_path}'
-                    self.log.error(error_msg)
-                    raise ImportError(error_msg)
-
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                self.log.debug(f'Successfully loaded config from file: {config_path}')
-            except Exception as e:
-                if module_name in sys.modules:
-                    del sys.modules[module_name]
-                error_msg = f"Failed to load configuration file '{config_path}': {e}"
-                self.log.error(error_msg)
-                raise ImportError(error_msg) from e
-        else:
-            # Relative paths and dotted paths - normalize to dotted module format
-            normalized_path = normalize_config_path(config_path)
-            self.log.debug(f'Normalized path: {normalized_path}')
-
-            # Import the module using the normalized dotted path
-            try:
-                if normalized_path in sys.modules:
-                    importlib.reload(sys.modules[normalized_path])
-                else:
-                    importlib.import_module(normalized_path)
-                self.log.debug(f'Successfully loaded config from module: {normalized_path}')
-            except ImportError as e:
-                error_msg = f"Failed to import configuration module '{normalized_path}' (from '{config_path}'): {e}"
-                self.log.error(error_msg)
-                raise ImportError(error_msg) from e
-            except Exception as e:
-                error_msg = f"An error occurred while importing '{normalized_path}' (from '{config_path}'): {e}"
-                self.log.error(error_msg)
-                raise Exception(error_msg) from e
+        load_config_module(config_path)
 
         # Now that the module has been loaded (which populated _job_data_registry
         # via the global `register` function), register the jobs with *this* instance.
@@ -543,6 +562,7 @@ class CronScheduler:
             'created_at': utcformat(self.created_at),
             'config_file': self.config_file or '',
             'cron_jobs': json.dumps([job.to_dict() for job in self._cron_jobs]),
+            'managed_cron_jobs': json.dumps([job.to_dict() for job in self._managed_cron_jobs]),
         }
         return obj
 
@@ -578,6 +598,16 @@ class CronScheduler:
         else:
             # Backward compatibility: missing field = no jobs
             self._cron_jobs = []
+
+        # Plan-managed jobs are restored for monitoring only; a running scheduler
+        # refreshes them from the plan store (re-resolving functions) on start.
+        if obj.get('managed_cron_jobs'):
+            try:
+                jobs_data = json.loads(obj['managed_cron_jobs'])
+                self._managed_cron_jobs = [CronJob.from_dict(job_data) for job_data in jobs_data]
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                self.log.warning(f'Failed to restore managed cron jobs: {e}')
+                self._managed_cron_jobs = []
 
     @classmethod
     def fetch(cls, name: str, connection: Redis) -> CronScheduler:
@@ -670,6 +700,69 @@ class CronScheduler:
 
 # Global registry to store job data before Cron instance is created
 _job_data_registry: list[dict] = []
+
+
+def load_config_module(config_path: str):
+    """Dynamically import a cron configuration module from a file or dotted path.
+
+    Supports absolute file paths, relative file paths (e.g. 'app/cron_config.py')
+    and dotted module paths (e.g. 'app.cron_config'), matching the path rules of
+    `CronScheduler.load_config_from_file()`. Importing the module executes its
+    top-level code, which is how `register()` calls populate a global registry.
+
+    Args:
+        config_path: File path or dotted module path to load.
+
+    Returns:
+        The loaded Python module.
+    """
+    log = logging.getLogger(__name__)
+
+    if os.path.isabs(config_path):
+        # Absolute paths must be loaded by file path (cannot be converted to valid module paths)
+        log.debug(f'Loading absolute file path: {config_path}')
+
+        # Validate the file path
+        validate_absolute_path(config_path)
+
+        # Load the file as a module
+        module_name = f'rq_cron_config_{os.path.basename(config_path).replace(".", "_")}'
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, config_path)
+            if spec is None or spec.loader is None:
+                error_msg = f'Could not create module spec for {config_path}'
+                log.error(error_msg)
+                raise ImportError(error_msg)
+
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            log.debug(f'Successfully loaded config from file: {config_path}')
+            return module
+        except Exception as e:
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            error_msg = f"Failed to load configuration file '{config_path}': {e}"
+            log.error(error_msg)
+            raise ImportError(error_msg) from e
+    else:
+        # Relative paths and dotted paths - normalize to dotted module format
+        normalized_path = normalize_config_path(config_path)
+        log.debug(f'Normalized path: {normalized_path}')
+
+        # Import the module using the normalized dotted path
+        try:
+            if normalized_path in sys.modules:
+                return importlib.reload(sys.modules[normalized_path])
+            return importlib.import_module(normalized_path)
+        except ImportError as e:
+            error_msg = f"Failed to import configuration module '{normalized_path}' (from '{config_path}'): {e}"
+            log.error(error_msg)
+            raise ImportError(error_msg) from e
+        except Exception as e:
+            error_msg = f"An error occurred while importing '{normalized_path}' (from '{config_path}'): {e}"
+            log.error(error_msg)
+            raise Exception(error_msg) from e
 
 
 def register(

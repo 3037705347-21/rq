@@ -2,6 +2,7 @@
 
 New Features:
 * Added [concurrency rate limits](https://python-rq.org/docs/#concurrency-rate-limits) via `queue.enqueue(func, rate_limit=RateLimit(...))`. Thanks @selwin!
+* Added declarative cron plans: define reviewable cron job manifests with `rq.cron_plan.define()`, reconcile them at release time with `rq cron-plan apply` / `rq.cron_plan.reconcile()`, and run them with `rq cron --plan-id`. Invalid plans (bad cron syntax, duplicate names, ...) are rejected as a whole, re-applying the same plan is a no-op, and jobs outside the plan are left untouched.
 * Workers can now track multiple executions, exposed via `worker.get_current_executions()` and `worker.current_execution_count`. Thanks @selwin!
 * Added `send_stop_execution_command()` to stop a single execution of a job. Thanks @selwin!
 * `Execution` now stores its job ID. Thanks @selwin!

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from time import sleep
 from unittest.mock import MagicMock, patch
@@ -981,6 +982,10 @@ class CronCLITestCase(CLITestCase):
         self.cron_config_path = os.path.abspath(os.path.join(current_dir, 'cron_config.py'))
         self.assertTrue(os.path.exists(self.cron_config_path), f'Config file not found at {self.cron_config_path}')
 
+        # Path to the declarative cron plan fixture
+        self.cron_plan_path = os.path.abspath(os.path.join(current_dir, 'cron_plan_config.py'))
+        self.assertTrue(os.path.exists(self.cron_plan_path), f'Plan file not found at {self.cron_plan_path}')
+
     def test_cron_execution(self):
         """rq cron <config_path> -u <url>"""
         runner = CliRunner()
@@ -1058,3 +1063,81 @@ class CronCLITestCase(CLITestCase):
             # Verify config loading and start were called
             mock_cron.load_config_from_file.assert_called_once_with(self.cron_config_path)
             mock_cron.start.assert_called_once()
+
+    def test_cron_requires_config_or_plan(self):
+        """rq cron -u <url> without a config or plan id is a usage error."""
+        runner = CliRunner()
+        result = runner.invoke(main, ['cron', '-u', self.redis_url])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn('CONFIG_PATH', result.output)
+
+    def test_cron_plan_mode(self):
+        """rq cron --plan-id p1 -u <url> starts the scheduler in plan mode without a config file."""
+        runner = CliRunner()
+        mock_cron = MagicMock()
+
+        with patch('rq.cli.cli_cron.CronScheduler', return_value=mock_cron) as mock_cron_class:
+            mock_cron.start.side_effect = lambda: None
+
+            result = runner.invoke(main, ['cron', '--plan-id', 'p1', '-u', self.redis_url])
+
+            self.assert_normal_execution(result)
+            self.assertEqual(mock_cron_class.call_args[1]['plan_id'], 'p1')
+            mock_cron.load_config_from_file.assert_not_called()
+            mock_cron.start.assert_called_once()
+
+    def test_cron_config_and_plan_together(self):
+        """rq cron <config_path> --plan-id p1 combines ad-hoc and managed jobs."""
+        runner = CliRunner()
+        mock_cron = MagicMock()
+
+        with patch('rq.cli.cli_cron.CronScheduler', return_value=mock_cron) as mock_cron_class:
+            mock_cron.start.side_effect = lambda: None
+
+            result = runner.invoke(main, ['cron', self.cron_config_path, '--plan-id', 'p1', '-u', self.redis_url])
+
+            self.assert_normal_execution(result)
+            self.assertEqual(mock_cron_class.call_args[1]['plan_id'], 'p1')
+            mock_cron.load_config_from_file.assert_called_once_with(self.cron_config_path)
+            mock_cron.start.assert_called_once()
+
+    def test_cron_plan_apply_and_reapply(self):
+        """rq cron-plan apply applies the plan once and reports a no-op on reapply."""
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main, ['cron-plan', 'apply', self.cron_plan_path, '-u', self.redis_url, '--plan-id', 'cli-plan']
+        )
+        self.assert_normal_execution(result)
+        self.assertIn('3 added', result.output)
+        self.assertIn('0 unchanged', result.output)
+
+        result = runner.invoke(
+            main, ['cron-plan', 'apply', self.cron_plan_path, '-u', self.redis_url, '--plan-id', 'cli-plan']
+        )
+        self.assert_normal_execution(result)
+        self.assertIn('0 added', result.output)
+        self.assertIn('3 unchanged', result.output)
+
+    def test_cron_plan_apply_rejected_invalid_plan_makes_no_changes(self):
+        """An invalid plan exits 1, lists the errors and never writes the plan namespace."""
+        runner = CliRunner()
+        plan_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', prefix='invalid_cron_plan_', delete=False)
+        plan_file.write(
+            'from rq.cron_plan import define\n'
+            'from tests.fixtures import say_hello\n'
+            "define(say_hello, queue_name='default', interval=60, name='dup')\n"
+            "define(say_hello, queue_name='default', cron='nonsense', name='dup')\n"
+        )
+        plan_file.close()
+        try:
+            result = runner.invoke(
+                main, ['cron-plan', 'apply', plan_file.name, '-u', self.redis_url, '--plan-id', 'rejected-plan']
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn('Rejected', result.output)
+            self.assertIn('dup', result.output)
+            self.assertIn('nonsense', result.output)
+            self.assertEqual(self.connection.exists('rq:cron:plan:rejected-plan'), 0)
+        finally:
+            os.unlink(plan_file.name)

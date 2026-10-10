@@ -69,3 +69,18 @@ class StopRequested(Exception):
     """Raised inside a worker to stop its work loop, e.g. after a stop signal or
     when the worker is suspended in burst mode.
     """
+
+
+class InvalidCronPlanError(Exception):
+    """Raised when a cron plan fails whole-batch validation.
+
+    Carries every problem found in the plan (invalid schedules, duplicate names,
+    ...) so they can be reviewed at once. The plan is rejected as a whole and no
+    existing state is changed.
+    """
+
+    def __init__(self, errors: str | list[str]):
+        if isinstance(errors, str):
+            errors = [errors]
+        self.errors: list[str] = list(errors)
+        super().__init__('; '.join(self.errors))
