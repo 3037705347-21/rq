@@ -66,6 +66,30 @@ class DuplicateSchedulerError(Exception):
 
 
 class StopRequested(Exception):
-    """Raised inside a worker to stop its work loop, e.g. after a stop signal or
+    """Raised inside a worker to stop the work loop, e.g. after a stop signal or
     when the worker is suspended in burst mode.
+    """
+
+
+class PayloadError(Exception):
+    """Base class for errors related to offloaded job payloads stored in the content store."""
+
+
+class PayloadNotFoundError(PayloadError):
+    """Raised when a job references an offloaded payload that does not exist in the content store.
+
+    The job itself is left untouched; this indicates a dangling reference that should be
+    reported, since the original inline payload is no longer present in the job hash.
+    """
+
+
+class PayloadIntegrityError(PayloadError):
+    """Raised when an offloaded payload's checksum does not match the reference,
+    or when a payload reference is malformed.
+    """
+
+
+class PayloadUnreadableError(PayloadError):
+    """Raised by the migration when a job's inline payload cannot be decoded
+    (zlib envelope) or loaded by its serializer. The job is deliberately left as-is.
     """

@@ -118,3 +118,9 @@ UNSERIALIZABLE_RETURN_VALUE_PAYLOAD = 'Unserializable return value'
 """ The value that we store in the job's _result property or in the Result's return_value
 in case the return value of the actual job is not serializable
 """
+
+
+DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD = 10 * 1024
+"""Default minimum size (in bytes, measured on the job hash's stored `data` field)
+from which a job payload is moved to the content store during migration.
+"""

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 from .callbacks import Callback
 from .exceptions import DeserializationError, InvalidJobOperation, NoSuchJobError
+from .payload_store import PayloadStore, is_payload_marker
 from .serializers import resolve_serializer
 from .types import FunctionReferenceType, JobDependencyType
 from .utils import (
@@ -974,6 +975,13 @@ class Job:
             raw_data = obj['data']
         except KeyError:
             raise NoSuchJobError(f'Unexpected job format: {obj}')
+
+        if is_payload_marker(raw_data):
+            # The payload was offloaded to the content store; fetch the exact bytes
+            # that used to live in this field. Raises PayloadNotFoundError /
+            # PayloadIntegrityError on a missing or corrupted blob so callers never
+            # silently read a different payload than the one that was enqueued.
+            raw_data = PayloadStore(self.connection).resolve(raw_data)
 
         try:
             self.data = zlib.decompress(raw_data)
