@@ -6,6 +6,11 @@ class NoSuchGroupError(Exception):
     """Raised by ``Group.fetch()`` when no group with the given name exists in Redis."""
 
 
+class InvalidRosterError(Exception):
+    """Raised by ``Group.settle()`` when the given member roster is itself invalid,
+    e.g. it is empty, contains duplicate IDs, or references jobs that don't exist in Redis."""
+
+
 class DeserializationError(Exception):
     """Raised when a job's stored data (function, args and kwargs) cannot be loaded by its serializer."""
 

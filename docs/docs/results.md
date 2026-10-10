@@ -55,6 +55,39 @@ for result in job.results():
     print(result.created_at, result.type)
 ```
 
+## Group Results
+
+When a group's members are added or removed in batches and the settlement may be
+interrupted or re-run, the member roster can be treated as the source of truth.
+`group.settle(members)` reconciles the group against the given roster (accepting
+job IDs or `Job` instances) and reads each member's real result individually.
+
+* If any roster member doesn't exist, `InvalidRosterError` is raised.
+* If all members exist but any one has no successful result yet, `settle()`
+  returns `None`. Nothing is written; call it again later.
+* Once every member has a successful result, membership is reconciled (missing
+  members are added, members dropped from the roster are removed) and a single
+  `GroupResult` is committed atomically. Its `results` attribute maps each
+  job ID to that job's return value.
+* Members added to the group manually, outside of any roster, are left
+  untouched. Re-running `settle()` with the same roster returns the same
+  `GroupResult` instead of producing a duplicate; a changed roster replaces the
+  stored result only after the new roster fully settles.
+
+```python
+from rq.group import Group
+
+group = Group.fetch(name='my-group', connection=redis)
+group_result = group.settle(['job1', 'job2', 'job3'])
+if group_result is None:
+    pass  # Results not all in yet, try again later
+else:
+    print(group_result.results)  # {'job1': ..., 'job2': ..., 'job3': ...}
+```
+
+An already committed result can be read without settling via
+`group.get_result()`, which returns `None` when no result has been committed.
+
 _New in version 1.16.0._
 To block until a result arrives, you can pass a timeout in seconds to `job.latest_result()`. If any results already exist, the latest result is returned immediately. If the timeout is reached without a result arriving, a `None` object is returned.
 
