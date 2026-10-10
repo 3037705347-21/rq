@@ -1151,3 +1151,186 @@ class TestRateLimitRetry(RQTestCase):
         self.assertEqual(job1.get_status(), JobStatus.SCHEDULED)
         self.assertIn(job1.id, ScheduledJobRegistry(queue=self.queue).get_job_ids())
         self.assertIn(job2.id, registry.get_allowed_job_ids())
+
+
+class TestRateLimitReconcile(RQTestCase):
+    """Test reconciling rate limit registries with an externally maintained manifest."""
+
+    def setUp(self):
+        super().setUp()
+        self.queue = Queue('default', connection=self.connection)
+
+    def _state(self) -> dict:
+        """Snapshot config hash, allowed ids and rate_limited ids for every registry."""
+        state = {}
+        for registry in RateLimitRegistry.all(self.connection):
+            state[registry.key] = (
+                self.connection.hgetall(registry.config_key),
+                registry.get_allowed_job_ids(),
+                registry.get_rate_limited_job_ids(),
+            )
+        return state
+
+    def test_reconcile_registers_new_keys(self):
+        """Manifest keys are registered with their concurrency and marked managed."""
+        result = RateLimitRegistry.reconcile({'a': 2, 'b': 3}, self.connection)
+        self.assertEqual(result, {'a': [], 'b': []})
+
+        registries = {registry.key: registry for registry in RateLimitRegistry.all(self.connection)}
+        self.assertEqual(set(registries), {'a', 'b'})
+        self.assertEqual(registries['a'].concurrency, 2)
+        self.assertEqual(registries['b'].concurrency, 3)
+        for registry in registries.values():
+            self.assertEqual(self.connection.hget(registry.config_key, 'managed'), b'1')
+
+    def test_reconcile_accepts_rate_limit_objects(self):
+        """An iterable of RateLimit is a valid manifest, in order."""
+        rate_limits = [RateLimit(key='a', concurrency=2), RateLimit(key='b', concurrency=1)]
+        result = RateLimitRegistry.reconcile(rate_limits, self.connection)
+        self.assertEqual(list(result), ['a', 'b'])
+        self.assertEqual({r.key for r in RateLimitRegistry.all(self.connection)}, {'a', 'b'})
+
+    def test_reconcile_raises_limit_promotes_waiting_jobs(self):
+        """Raising concurrency promotes the oldest waiting jobs up to the new quota."""
+        rate_limit = RateLimit(key='api', concurrency=1)
+        job1 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job2 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job3 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job4 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+
+        # Wait scores are integer seconds, so jobs parked in the same fast test tie;
+        # pin deterministic FIFO order (in production these enqueues span seconds).
+        registry = RateLimitRegistry(key='api', connection=self.connection)
+        for offset, job in enumerate([job2, job3, job4], start=1):
+            self.connection.zadd(registry.rate_limited_key, {job.id: offset})
+
+        promoted = RateLimitRegistry.reconcile({'api': 3}, self.connection)
+
+        self.assertEqual(promoted['api'], [job2.id, job3.id])
+        self.assertEqual(self.queue.job_ids, [job1.id, job2.id, job3.id])
+        self.assertEqual(job2.get_status(), JobStatus.QUEUED)
+        self.assertEqual(registry.concurrency, 3)
+        self.assertEqual(registry.get_allowed_job_count(), 3)
+        self.assertEqual(registry.get_rate_limited_job_ids(), [job4.id])
+
+    def test_reconcile_lower_does_not_exceed_new_limit(self):
+        """Lowering concurrency admits nothing while over the cap; later releases
+        keep the key at or below the new value and promote only once under it."""
+        rate_limit = RateLimit(key='api', concurrency=3)
+        job1 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job2 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job3 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        job4 = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+
+        promoted = RateLimitRegistry.reconcile({'api': 1}, self.connection)
+        self.assertEqual(promoted['api'], [])
+
+        # Read concurrency fresh from the reconciled config.
+        registry = RateLimitRegistry(key='api', connection=self.connection)
+        self.assertEqual(registry.get_allowed_job_count(), 3)
+        self.assertEqual(registry.get_rate_limited_job_ids(), [job4.id])
+
+        # Two releases still leave the key at the new cap → nobody promoted.
+        self.assertEqual(registry.release_and_enqueue(job1.id), [])
+        self.assertEqual(registry.get_allowed_job_count(), 2)
+        self.assertEqual(registry.release_and_enqueue(job2.id), [])
+        self.assertEqual(registry.get_allowed_job_count(), 1)
+
+        # Dropping below the cap finally promotes the waiting job.
+        self.assertEqual(registry.release_and_enqueue(job3.id), [job4.id])
+        self.assertEqual(registry.get_allowed_job_ids(), [job4.id])
+
+    def test_reconcile_cleans_removed_managed_key_when_drained(self):
+        """A managed key missing from the manifest is deleted once drained."""
+        RateLimitRegistry.reconcile({'a': 1}, self.connection)
+
+        RateLimitRegistry.reconcile({}, self.connection)
+
+        self.assertEqual(RateLimitRegistry.all(self.connection), [])
+        registry = RateLimitRegistry(key='a', connection=self.connection)
+        self.assertFalse(self.connection.exists(registry.config_key, registry.allowed_key, registry.rate_limited_key))
+
+    def test_reconcile_keeps_removed_key_until_drained(self):
+        """A non-drained removed key is retained; it is cleaned on a later run once empty."""
+        RateLimitRegistry.reconcile({'a': 1}, self.connection)
+        registry = RateLimitRegistry(key='a', connection=self.connection)
+        job = Job.create(func='tests.fixtures.say_hello', connection=self.connection)
+        job.save()
+        self.connection.zadd(registry.allowed_key, {job.id: 1})
+
+        # Still holds a job: the registry and its managed marker survive.
+        RateLimitRegistry.reconcile({}, self.connection)
+        state_after_first = self._state()
+        self.assertTrue(self.connection.exists(registry.config_key))
+        self.assertEqual(self.connection.hget(registry.config_key, 'managed'), b'1')
+
+        # Repeating the same manifest changes nothing (retry is a no-op).
+        RateLimitRegistry.reconcile({}, self.connection)
+        self.assertEqual(self._state(), state_after_first)
+
+        # Once drained, the next run removes it.
+        self.connection.zrem(registry.allowed_key, job.id)
+        RateLimitRegistry.reconcile({}, self.connection)
+        self.assertEqual(RateLimitRegistry.all(self.connection), [])
+
+    def test_reconcile_leaves_ad_hoc_keys_untouched(self):
+        """Keys created by ad-hoc jobs (never in a manifest) are never modified or removed."""
+        job = self.queue.enqueue(say_hello, rate_limit=RateLimit(key='adhoc', concurrency=1))
+
+        RateLimitRegistry.reconcile({'other': 1}, self.connection)
+        registry = RateLimitRegistry(key='adhoc', connection=self.connection)
+        self.assertIsNone(self.connection.hget(registry.config_key, 'managed'))
+        self.assertEqual(registry.get_allowed_job_ids(), [job.id])
+
+        # An empty manifest doesn't remove it either.
+        RateLimitRegistry.reconcile({}, self.connection)
+        self.assertEqual(registry.get_allowed_job_ids(), [job.id])
+        self.assertIn('adhoc', {r.key for r in RateLimitRegistry.all(self.connection)})
+
+    def test_reconcile_adopts_existing_ad_hoc_key(self):
+        """An existing ad-hoc key that appears in the manifest becomes managed and
+        takes the manifest's concurrency."""
+        self.queue.enqueue(say_hello, rate_limit=RateLimit(key='api', concurrency=1))
+
+        RateLimitRegistry.reconcile({'api': 5}, self.connection)
+
+        registry = RateLimitRegistry(key='api', connection=self.connection)
+        self.assertEqual(registry.concurrency, 5)
+        self.assertEqual(self.connection.hget(registry.config_key, 'managed'), b'1')
+
+    def test_reconcile_invalid_manifest_changes_nothing(self):
+        """Any invalid entry raises ValueError before writes; existing state is untouched."""
+        RateLimitRegistry.reconcile({'a': 1}, self.connection)
+
+        invalid_manifests = [
+            {'': 1},  # empty key
+            {1: 1},  # non-string key
+            {'b': 0},  # concurrency below 1
+            {'b': -1},
+            {'b': 1.5},  # non-integer concurrency
+            {'b': '1'},
+            {'b': True},  # bool is not an accepted concurrency
+            {'new': 2, 'bad': 0},  # valid entry mixed with an invalid one
+            [RateLimit(key='a', concurrency=1), RateLimit(key='a', concurrency=2)],  # duplicate
+        ]
+        for invalid in invalid_manifests:
+            state_before = self._state()
+            with self.assertRaises(ValueError):
+                RateLimitRegistry.reconcile(invalid, self.connection)
+            self.assertEqual(self._state(), state_before)
+
+    def test_reconcile_is_idempotent(self):
+        """Applying the same manifest again promotes nothing and leaves state identical."""
+        rate_limit = RateLimit(key='api', concurrency=1)
+        self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        self.queue.enqueue(say_hello, rate_limit=rate_limit)
+        self.queue.enqueue(say_hello, rate_limit=rate_limit)
+
+        RateLimitRegistry.reconcile({'api': 3}, self.connection)
+        state_after_first = self._state()
+
+        self.assertEqual(RateLimitRegistry.reconcile({'api': 3}, self.connection), {'api': []})
+        self.assertEqual(self._state(), state_after_first)
+
+        RateLimitRegistry.reconcile({'api': 3}, self.connection)
+        self.assertEqual(self._state(), state_after_first)

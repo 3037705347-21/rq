@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from functools import cached_property
 
@@ -140,6 +141,98 @@ class RateLimitRegistry:
         """Return a registry for the job's rate limit key and connection."""
         assert job.rate_limit_key
         return cls(key=job.rate_limit_key, connection=job.connection)
+
+    @staticmethod
+    def _parse_manifest(rate_limits: Mapping[str, int] | Iterable[RateLimit]) -> dict[str, int]:
+        """Validate a manifest and return it as an ordered {key: concurrency} dict.
+
+        Args:
+            rate_limits: A mapping of rate limit key to concurrency, or an iterable
+                of `RateLimit` (duplicate keys are rejected).
+
+        Returns:
+            The manifest as a dict, preserving the input order.
+
+        Raises:
+            ValueError: A key is not a non-empty string, a concurrency is not an
+                integer of at least 1, or a key appears more than once.
+        """
+        if isinstance(rate_limits, Mapping):
+            entries = list(rate_limits.items())
+        else:
+            entries = [(rate_limit.key, rate_limit.concurrency) for rate_limit in rate_limits]
+
+        manifest: dict[str, int] = {}
+        for key, concurrency in entries:
+            if not isinstance(key, str) or not key:
+                raise ValueError('rate limit key must be a non-empty string')
+            if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+                raise ValueError(f'concurrency for {key!r} must be an integer of at least 1')
+            if key in manifest:
+                raise ValueError(f'duplicate rate limit key: {key!r}')
+            manifest[key] = concurrency
+        return manifest
+
+    @classmethod
+    def reconcile(cls, rate_limits: Mapping[str, int] | Iterable[RateLimit], connection: Redis) -> dict[str, list[str]]:
+        """Reconcile registries with an externally maintained manifest of concurrency limits.
+
+        Call at publish time so stored limits follow the manifest:
+
+        - Each listed key is registered, its `concurrency` set from the manifest and
+          marked as managed. Waiting jobs are promoted up to the new quota, so raising
+          a limit releases the jobs that have been waiting; lowering it admits nothing
+          while the key is at or over the new cap (existing jobs keep their slots, and
+          later releases read the lowered value).
+        - A managed key missing from the manifest is deleted, but only once its allowed
+          and rate_limited sets are empty; a non-drained key is kept and retried on the
+          next run.
+        - Keys created by ad-hoc jobs (never listed in a manifest) are never touched.
+
+        Args:
+            rate_limits: A mapping of rate limit key to concurrency, or an iterable of
+                `RateLimit`.
+            connection: The Redis connection.
+
+        Returns:
+            Mapping of each manifest key to the job ids promoted while reconciling it.
+
+        Raises:
+            ValueError: The manifest is invalid; no changes are made to any registry.
+        """
+        # Validate the whole manifest before a single write.
+        manifest = cls._parse_manifest(rate_limits)
+
+        # Snapshot existing registries and their managed flags before writing.
+        existing = cls.all(connection)
+        with connection.pipeline() as pipeline:
+            for registry in existing:
+                pipeline.hget(registry.config_key, 'managed')
+            managed_flags = pipeline.execute()
+        managed_keys = {registry.key for registry, flag in zip(existing, managed_flags) if flag is not None}
+
+        # Persist every listed key's config in a single batch.
+        registries = {key: cls(key=key, connection=connection) for key in manifest}
+        with connection.pipeline() as pipeline:
+            for key, concurrency in manifest.items():
+                pipeline.sadd(cls.rl_keys_key, key)
+                pipeline.hset(registries[key].config_key, mapping={'concurrency': concurrency, 'managed': 1})
+            pipeline.execute()
+
+        # Promote waiting jobs into the new quota; each call is one atomic Lua script.
+        promoted: dict[str, list[str]] = {}
+        for key, concurrency in manifest.items():
+            promoted[key] = registries[key].acquire_and_enqueue(concurrency)
+
+        # Keys the manifest previously owned but no longer lists: drop once drained.
+        for registry in existing:
+            if registry.key in managed_keys and registry.key not in manifest:
+                registry._cleanup_script(
+                    keys=[registry.allowed_key, registry.rate_limited_key, registry.config_key],
+                    args=[cls.rl_keys_key, registry.key],
+                )
+
+        return promoted
 
     @property
     def config_key(self) -> str:
