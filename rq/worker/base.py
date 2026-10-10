@@ -39,6 +39,7 @@ from ..defaults import (
     DEFAULT_LOGGING_FORMAT,
     DEFAULT_MAINTENANCE_TASK_INTERVAL,
     DEFAULT_RESULT_TTL,
+    DEFAULT_WEBHOOK_RECONCILE_INTERVAL,
     DEFAULT_WORKER_TTL,
 )
 from ..exceptions import DequeueTimeout, DeserializationError, StopRequested
@@ -69,6 +70,7 @@ from ..utils import (
     utcparse,
 )
 from ..version import VERSION
+from ..webhook_delivery import deliver_webhook_deliveries, reconcile_pending_webhooks
 
 try:
     from setproctitle import setproctitle as setprocname
@@ -146,6 +148,7 @@ class BaseWorker:
         queue_class: type[Queue] | str | None = None,
         log_job_description: bool = True,
         job_monitoring_interval=DEFAULT_JOB_MONITORING_INTERVAL,
+        webhook_reconcile_interval: int = DEFAULT_WEBHOOK_RECONCILE_INTERVAL,
         disable_default_exception_handler: bool = False,
         prepare_for_work: bool = True,
         serializer: Serializer | str | None = None,
@@ -163,6 +166,7 @@ class BaseWorker:
 
         self.job_monitoring_interval = job_monitoring_interval
         self.maintenance_interval = maintenance_interval
+        self.webhook_reconcile_interval = webhook_reconcile_interval
 
         if not connection:
             connection = get_connection_from_queues(queues)
@@ -222,6 +226,7 @@ class BaseWorker:
         self.log = logger
         self.log_job_description = log_job_description
         self.last_cleaned_at = None
+        self.last_webhook_reconcile_at: datetime | None = None
         self.successful_job_count: int = 0
         self.failed_job_count: int = 0
         self.total_working_time: float = 0
@@ -420,6 +425,37 @@ class BaseWorker:
         if (now() - self.last_cleaned_at) > timedelta(seconds=self.maintenance_interval):
             return True
         return False
+
+    @property
+    def should_reconcile_webhook_deliveries(self) -> bool:
+        """Due webhook deliveries should be reconciled on first startup and then
+        every `webhook_reconcile_interval` seconds (default 1 minute)."""
+        if self.last_webhook_reconcile_at is None:
+            return True
+        return (now() - self.last_webhook_reconcile_at) > timedelta(seconds=self.webhook_reconcile_interval)
+
+    def reconcile_webhook_deliveries(self) -> None:
+        """Retries due, previously-failed webhook deliveries.
+
+        Runs only on the interval gate and never raises: reconciling
+        notifications must not interfere with job processing or with jobs that
+        haven't reached a terminal state.
+        """
+        if not self.should_reconcile_webhook_deliveries:
+            return
+        try:
+            examined = reconcile_pending_webhooks(self.connection)
+            if examined:
+                self.log.info(
+                    'Worker %s: reconciled %d due webhook deliver%s',
+                    self.name,
+                    examined,
+                    'y' if examined == 1 else 'ies',
+                )
+        except Exception:
+            self.log.warning('Worker %s: webhook reconciliation raised', self.name, exc_info=True)
+        finally:
+            self.last_webhook_reconcile_at = now()
 
     def _set_connection(self, connection: Redis) -> Redis:
         """Configures the Redis connection's socket timeout.
@@ -643,6 +679,8 @@ class BaseWorker:
                     if self.should_run_maintenance_tasks:
                         self.run_maintenance_tasks()
 
+                    self.reconcile_webhook_deliveries()
+
                     if self._stop_requested:
                         self.log.info('Worker %s: stopping on request', self.name)
                         break
@@ -751,6 +789,15 @@ class BaseWorker:
 
             self.cleanup_execution(job, pipeline=pipeline, execution=execution)
 
+            # Register pending webhook deliveries together with the terminal failure
+            # (buffered before the first execute below), so a crash afterwards still
+            # leaves durable records for reconciliation to converge.
+            pending_deliveries = []
+            if not retry and not job_is_stopped:
+                pending_deliveries = job.persist_webhook_deliveries(
+                    JobStatus.FAILED, pipeline=pipeline, exc_string=exc_string
+                )
+
             if not self.disable_default_exception_handler and not retry:
                 job._handle_failure(
                     exc_string,
@@ -776,9 +823,10 @@ class BaseWorker:
             try:
                 pipeline.execute()
                 # Send webhooks once the failure is persisted, and before enqueue_dependents
-                # so an exception there can't skip them. send_webhooks never raises.
-                if not retry and not job_is_stopped:
-                    job.send_webhooks(JobStatus.FAILED, exc_string=exc_string)
+                # so an exception there can't skip them. Delivery never raises; failures
+                # stay pending and are retried by webhook reconciliation.
+                if pending_deliveries:
+                    deliver_webhook_deliveries(self.connection, pending_deliveries, job=job)
                 if should_enqueue_dependents:
                     queue.enqueue_dependents(job)
                 release_slot(job)
@@ -1144,6 +1192,8 @@ class BaseWorker:
                 if self.should_run_maintenance_tasks:
                     self.run_maintenance_tasks()
 
+                self.reconcile_webhook_deliveries()
+
                 if timeout is not None and idle_time_left is not None:
                     timeout = min(timeout, idle_time_left)
 
@@ -1425,11 +1475,15 @@ class BaseWorker:
                 self.increment_failed_job_count(pipeline=pipeline)
                 self.increment_total_working_time(job.ended_at - job.started_at, pipeline)  # type: ignore
 
+                # Register pending webhook deliveries in the same transaction as the
+                # terminal failure; no exception was raised, so exc_string is empty.
+                pending_deliveries = job.persist_webhook_deliveries(JobStatus.FAILED, pipeline=pipeline, exc_string='')
+
                 try:
                     pipeline.execute()
-                    # Send webhooks before enqueue_dependents so an exception there can't skip them.
-                    # No exception was raised, so exc_string is empty.
-                    job.send_webhooks(JobStatus.FAILED, exc_string='')
+                    # Deliver before enqueue_dependents so an exception there can't skip
+                    # them. Failures stay pending and are retried by reconciliation.
+                    deliver_webhook_deliveries(self.connection, pending_deliveries, job=job)
                     queue.enqueue_dependents(job)
                     release_slot(job)
                 except Exception as e:
@@ -1526,6 +1580,10 @@ class BaseWorker:
                     self.log.debug('Cleaning up execution of job %s', job.id)
                     self.cleanup_execution(job, pipeline=pipeline, execution=execution)
 
+                    # Register pending webhook deliveries in the same transaction as the
+                    # terminal success so a crash after commit still leaves durable records.
+                    job.persist_webhook_deliveries(JobStatus.FINISHED, pipeline=pipeline)
+
                     pipeline.execute()
 
                     # Enqueue the dependents that the commit moved to ready. Per-queue failures
@@ -1580,7 +1638,10 @@ class BaseWorker:
         self.handle_job_success(
             job=job, queue=queue, started_job_registry=queue.started_job_registry, execution=execution
         )
-        job.send_webhooks(JobStatus.FINISHED)
+        # Delivery records were persisted with the terminal success above; send
+        # them now. Already-delivered records are skipped; failures are retried
+        # by webhook reconciliation.
+        job.deliver_webhooks(JobStatus.FINISHED)
 
         self.log.info('Worker %s: %s: %s (%s)', self.name, green(job.origin), blue('Job OK'), job.id)
         if return_value is not None:

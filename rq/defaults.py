@@ -87,6 +87,45 @@ in seconds. Defaults to 10 minutes.
 """
 
 
+DEFAULT_WEBHOOK_RETRY_INITIAL_DELAY = 30
+""" The delay in seconds before a failed webhook delivery is first retried.
+Retries then use exponential backoff
+(30, 60, 120, ... up to DEFAULT_WEBHOOK_RETRY_MAX_DELAY).
+"""
+
+
+DEFAULT_WEBHOOK_RETRY_MAX_DELAY = 60 * 60
+""" The cap on webhook delivery retry backoff, in seconds (1 hour).
+"""
+
+
+DEFAULT_WEBHOOK_DELIVERY_MAX_AGE = 3 * 24 * 60 * 60
+""" How long a pending webhook delivery keeps being retried before it is
+marked as dead, in seconds. Defaults to 3 days.
+"""
+
+
+DEFAULT_WEBHOOK_DELIVERED_TTL = 24 * 60 * 60
+""" How long delivered and dead webhook delivery records are kept in Redis
+for audit and deduplication, in seconds. Defaults to 1 day.
+"""
+
+
+DEFAULT_WEBHOOK_RECONCILE_INTERVAL = 60
+""" How often workers scan for due webhook deliveries to retry, in seconds.
+"""
+
+
+DEFAULT_WEBHOOK_RECONCILE_BATCH_SIZE = 100
+""" Maximum number of due webhook deliveries a single reconciliation pass sends.
+"""
+
+
+DEFAULT_WEBHOOK_RECONCILE_LOCK_TTL = 5 * 60
+""" TTL of the global webhook reconciliation lock, in seconds.
+"""
+
+
 CALLBACK_TIMEOUT = 60
 """ The timeout period in seconds for Callback functions
 Means that Functions used in `success_callback`, `stopped_callback`,

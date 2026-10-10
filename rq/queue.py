@@ -40,6 +40,7 @@ from .serializers import Serializer, resolve_serializer
 from .types import FunctionReferenceType, JobDependencyType
 from .utils import as_text, backend_class, compact, get_version, import_attribute, now, parse_timeout
 from .webhook import Webhook
+from .webhook_delivery import deliver_webhook_deliveries
 
 logger = logging.getLogger('rq.queue')
 
@@ -976,6 +977,9 @@ class Queue:
         with self.connection.pipeline() as pipeline:
             job._handle_success(result_ttl=result_ttl, pipeline=pipeline, worker_name='')
             job.cleanup(result_ttl, pipeline=pipeline)
+            # Register finished webhook deliveries in the same transaction as the
+            # terminal success so a crash after commit still leaves durable records.
+            job.persist_webhook_deliveries(JobStatus.FINISHED, pipeline=pipeline)
             pipeline.execute()
         return job
 
@@ -1465,14 +1469,20 @@ class Queue:
         except:  # noqa
             with self.connection.pipeline() as pipeline:
                 exc_string = format_exc_info(sys.exc_info())
+                job.ended_at = now()
                 record_job_failure(job, exc_string, pipeline)
+                pending_deliveries = job.persist_webhook_deliveries(
+                    JobStatus.FAILED, pipeline=pipeline, exc_string=exc_string
+                )
                 pipeline.execute()
 
             execute_failure_callback(job, self.death_penalty_class, *sys.exc_info())
-            job.send_webhooks(JobStatus.FAILED, exc_string=exc_string)
+            # Failures stay pending and are retried by webhook reconciliation.
+            deliver_webhook_deliveries(self.connection, pending_deliveries, job=job)
         else:
             execute_success_callback(job, self.death_penalty_class, job.return_value())
-            job.send_webhooks(JobStatus.FINISHED)
+            # Records were persisted inside run_job(); send them now.
+            job.deliver_webhooks(JobStatus.FINISHED)
 
         return job
 

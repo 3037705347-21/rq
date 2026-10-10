@@ -3,6 +3,7 @@ RQ command line tool
 """
 
 import sys
+import time
 
 import click
 from redis.exceptions import ConnectionError
@@ -166,6 +167,38 @@ def resume(cli_config, **options):
     """Resumes processing of queues, that were suspended with `rq suspend`"""
     connection_resume(cli_config.connection)
     click.echo('Resuming workers.')
+
+
+@main.command('reconcile-webhooks')
+@click.option(
+    '--batch-size',
+    type=int,
+    default=None,
+    help='Maximum number of due deliveries to attempt in a single pass (default: 100).',
+)
+@click.option(
+    '--interval',
+    type=float,
+    default=None,
+    help='Keep running and reconcile every N seconds. By default a single pass is run.',
+)
+@pass_cli_config
+def reconcile_webhooks(cli_config, batch_size, interval, **options):
+    """Retries webhook deliveries that failed when their job reached a terminal state.
+
+    Already-delivered webhooks are never sent again; workers also reconcile
+    automatically, this command is mainly useful for worker-less (synchronous)
+    deployments or one-off backfills.
+    """
+    from rq import reconcile_pending_webhooks
+
+    kwargs = {'batch_size': batch_size} if batch_size else {}
+    while True:
+        examined = reconcile_pending_webhooks(cli_config.connection, **kwargs)
+        click.echo(f'Reconciled {examined} due webhook deliver{"y" if examined == 1 else "ies"}.')
+        if interval is None:
+            break
+        time.sleep(interval)
 
 
 @main.command()

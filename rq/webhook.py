@@ -12,6 +12,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger('rq.webhook')
 
+IDEMPOTENCY_KEY_HEADER = 'Idempotency-Key'
+
 
 @dataclass
 class Webhook:
@@ -85,16 +87,82 @@ class Webhook:
             payload['exc_info'] = exc_string
         return payload
 
-    def send(self, job: Job, *, exc_string: str | None = None) -> None:
-        """Performs the HTTP request. Errors are logged, never raised."""
-        try:
-            if self.method == 'GET':
-                request = Request(self.url, headers=self.headers or {}, method='GET')
-            else:
-                body = json.dumps(self.get_payload(job, exc_string=exc_string)).encode('utf-8')
-                headers = {'Content-Type': 'application/json', **(self.headers or {})}
-                request = Request(self.url, data=body, headers=headers, method='POST')
-            with urlopen(request, timeout=self.timeout):
-                pass
-        except Exception:
-            logger.warning('Failed to send webhook to %s for job %s', self.url, job.id, exc_info=True)
+    def send(self, job: Job, *, exc_string: str | None = None, idempotency_key: str | None = None) -> bool:
+        """Performs the HTTP request. Errors are logged, never raised.
+
+        Returns `True` when the endpoint accepted the request (2xx/3xx) and
+        `False` when sending failed.
+        """
+        payload = None if self.method == 'GET' else self.get_payload(job, exc_string=exc_string)
+        return send_webhook(
+            url=self.url,
+            method=self.method,
+            headers=self.headers,
+            timeout=self.timeout,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            log_context=f'job {job.id}',
+        )
+
+
+def perform_webhook_request(
+    *,
+    url: str,
+    method: str,
+    headers: dict[str, str] | None,
+    timeout: int,
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> None:
+    """Performs a webhook HTTP request from already-serialized data.
+
+    Unlike `Webhook.send()`, this doesn't need a `Job` instance, so it can
+    resend deliveries long after the job itself has expired. Raises on any
+    failure (connection error, timeout, HTTP error); callers decide how to
+    record the outcome.
+    """
+    request_headers = dict(headers or {})
+    if idempotency_key:
+        request_headers[IDEMPOTENCY_KEY_HEADER] = idempotency_key
+
+    if method == 'GET':
+        request = Request(url, headers=request_headers, method='GET')
+    else:
+        body = json.dumps(payload).encode('utf-8') if payload is not None else b''
+        request = Request(
+            url, data=body, headers={'Content-Type': 'application/json', **request_headers}, method='POST'
+        )
+    with urlopen(request, timeout=timeout):
+        pass
+
+
+def send_webhook(
+    *,
+    url: str,
+    method: str,
+    headers: dict[str, str] | None,
+    timeout: int,
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    log_context: str = '',
+) -> bool:
+    """Performs a webhook request, returning whether it succeeded.
+
+    Errors are logged and never raised so a dead endpoint can never abort a
+    job or a reconciliation pass.
+    """
+    try:
+        perform_webhook_request(
+            url=url,
+            method=method,
+            headers=headers,
+            timeout=timeout,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+    except Exception:
+        logger.warning(
+            'Failed to send webhook to %s%s', url, f' for {log_context}' if log_context else '', exc_info=True
+        )
+        return False
+    return True

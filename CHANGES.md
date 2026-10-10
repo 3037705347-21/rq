@@ -1,6 +1,7 @@
 ### RQ 3.0 (unreleased)
 
 New Features:
+* Terminal-state webhooks are now delivered reliably: each webhook gets a durable delivery record in Redis (created atomically with the terminal state), failed sends are retried with exponential backoff by periodic worker reconciliation (`reconcile_pending_webhooks()` / `rq reconcile-webhooks`), delivered webhooks are never re-sent, and every request carries an `Idempotency-Key` header. Thanks @selwin!
 * Added [concurrency rate limits](https://python-rq.org/docs/#concurrency-rate-limits) via `queue.enqueue(func, rate_limit=RateLimit(...))`. Thanks @selwin!
 * Workers can now track multiple executions, exposed via `worker.get_current_executions()` and `worker.current_execution_count`. Thanks @selwin!
 * Added `send_stop_execution_command()` to stop a single execution of a job. Thanks @selwin!

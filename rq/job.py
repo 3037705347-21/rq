@@ -49,6 +49,11 @@ from .utils import (
     utcformat,
 )
 from .webhook import Webhook
+from .webhook_delivery import (
+    build_webhook_deliveries,
+    deliver_webhook_deliveries,
+    persist_webhook_deliveries,
+)
 
 logger = logging.getLogger('rq.job')
 
@@ -1610,14 +1615,50 @@ class Job:
             self.origin, connection=self.connection, job_class=self.__class__, serializer=self.serializer
         )
 
+    def persist_webhook_deliveries(
+        self,
+        status: str | JobStatus,
+        *,
+        pipeline: Pipeline | None = None,
+        exc_string: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> list:
+        """Persists pending delivery records for every webhook registered for
+        the given terminal job status.
+
+        When `pipeline` is given the records are buffered into it, so the
+        notification records land atomically with the job's terminal state:
+        a crash after the commit still leaves something to reconcile. The
+        returned deliveries should be handed to `deliver_webhook_deliveries()`
+        after the pipeline executes.
+        """
+        return persist_webhook_deliveries(
+            self.connection, self, status, exc_string=exc_string, pipeline=pipeline, occurred_at=occurred_at
+        )
+
+    def deliver_webhooks(
+        self,
+        status: str | JobStatus,
+        *,
+        exc_string: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """Attempts the (already persisted) webhook deliveries for `status`
+        once, immediately. Records that are already delivered are skipped.
+        Send errors are logged, never raised, and left for reconciliation."""
+        deliveries = build_webhook_deliveries(self, status, exc_string=exc_string, occurred_at=occurred_at)
+        deliver_webhook_deliveries(self.connection, deliveries, job=self)
+
     def send_webhooks(self, status: str | JobStatus, *, exc_string: str | None = None) -> None:
-        """Sends every webhook registered for the given terminal job status.
-        `exc_string` is included in the payload of `failed` webhooks.
-        Send errors are logged by `Webhook.send()`, never raised."""
-        for webhook in self.webhooks:
-            if webhook.job_status == status:
-                self.log.debug('Job %s: sending %s webhook to %s', self.id, webhook.job_status, webhook.url)
-                webhook.send(self, exc_string=exc_string)
+        """Persists and immediately sends every webhook registered for the
+        given terminal job status.
+
+        `exc_string` is included in the payload of `failed` webhooks. Failed
+        sends remain durable pending deliveries and are retried by
+        webhook reconciliation; nothing is raised.
+        """
+        deliveries = self.persist_webhook_deliveries(status, exc_string=exc_string)
+        deliver_webhook_deliveries(self.connection, deliveries, job=self)
 
     def _handle_success(
         self,

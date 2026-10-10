@@ -141,6 +141,34 @@ class TestRQCli(CLITestCase):
         self.assert_normal_execution(result)
         self.assertEqual(result.output.strip(), 'Nothing to do')
 
+    def test_reconcile_webhooks(self):
+        """rq reconcile-webhooks delivers due pending webhook deliveries."""
+        from rq import Webhook
+        from rq.webhook_delivery import PENDING_DELIVERIES_KEY, WebhookDelivery
+
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello, webhooks=[Webhook('http://example.com/hook', 'finished', method='POST')])
+        # Simulate a terminal success whose immediate send hasn't happened yet:
+        # persist the record directly, then make it due.
+        job.ended_at = datetime.now(timezone.utc)
+        job.persist_webhook_deliveries(JobStatus.FINISHED)
+        delivery_id = self.connection.zrange(PENDING_DELIVERIES_KEY, 0, -1)[0].decode()
+        self.connection.zadd(PENDING_DELIVERIES_KEY, {delivery_id: 0})
+
+        runner = CliRunner()
+        with patch('rq.webhook_delivery.send_webhook', return_value=True):
+            result = runner.invoke(main, ['reconcile-webhooks', '-u', self.redis_url])
+        self.assert_normal_execution(result)
+        self.assertIn('Reconciled 1 due webhook delivery.', result.output)
+
+        raw = self.connection.hgetall(f'rq:webhook:delivery:{delivery_id}')
+        self.assertEqual(WebhookDelivery.from_hash(raw).state, 'delivered')
+
+        # Nothing due on a second run.
+        result = runner.invoke(main, ['reconcile-webhooks', '-u', self.redis_url])
+        self.assert_normal_execution(result)
+        self.assertIn('Reconciled 0 due webhook deliveries.', result.output)
+
     def test_requeue(self):
         """rq requeue -u <url> --all"""
         connection = Redis.from_url(self.redis_url)

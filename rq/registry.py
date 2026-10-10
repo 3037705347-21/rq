@@ -22,6 +22,7 @@ from .queue import Queue
 from .rate_limit import RateLimitRegistry, release_slot
 from .timeouts import BaseDeathPenalty, UnixSignalDeathPenalty
 from .utils import as_text, backend_class, current_timestamp, now, parse_composite_key
+from .webhook_delivery import deliver_webhook_deliveries
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -315,14 +316,20 @@ class StartedJobRegistry(BaseRegistry):
                 if retry:
                     job.retry(queue, pipeline)
                 else:
+                    occurred_at = now()
                     exc_string = (
-                        f'Moved to {FailedJobRegistry.__name__}, due to {AbandonedJobError.__name__}, at {now()}'
+                        f'Moved to {FailedJobRegistry.__name__}, due to {AbandonedJobError.__name__}, at {occurred_at}'
                     )
                     logger.warning('%s cleanup: %s %s', self.__class__.__name__, job.id, exc_string)
                     record_job_failure(job, exc_string, pipeline)
+                    # Register failed webhook deliveries in the same transaction as
+                    # the terminal failure so a crash after commit can't lose them.
+                    pending_deliveries = job.persist_webhook_deliveries(
+                        JobStatus.FAILED, pipeline=pipeline, exc_string=exc_string, occurred_at=occurred_at
+                    )
                     # Use the cached status: FAILED is still buffered in the pipeline.
                     queue.enqueue_dependents(job, refresh_job_status=False)
-                    failed_jobs.append((job, exc_string))
+                    failed_jobs.append((job, pending_deliveries))
 
                 processed_jobs.append(job)
 
@@ -330,8 +337,8 @@ class StartedJobRegistry(BaseRegistry):
             pipeline.execute()
 
         # Fire failed webhooks only after the terminal failures are persisted.
-        for failed_job, exc_string in failed_jobs:
-            failed_job.send_webhooks(JobStatus.FAILED, exc_string=exc_string)
+        for failed_job, pending_deliveries in failed_jobs:
+            deliver_webhook_deliveries(self.connection, pending_deliveries, job=failed_job)
 
         # Release only after the commit, so promotion sees each job's persisted status.
         for job in processed_jobs:

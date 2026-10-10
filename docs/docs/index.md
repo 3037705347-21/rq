@@ -517,8 +517,46 @@ Webhooks are sent once the job's terminal state is persisted:
 * A `finished` webhook fires after `on_success` runs and the job's successful result is saved.
 * A `failed` webhook fires after the failure is persisted as a terminal failure (which also runs after `on_failure`). It is **not** sent for attempts that will be [retried](/docs/exceptions/#retrying-failed-jobs) or for jobs that are [stopped](/docs/workers/#stopping-a-job).
 
-Delivery is best-effort: send errors (unreachable endpoint, timeout, HTTP error) are
-logged and swallowed, so a failing webhook never affects job execution. Sending is blocking, so a slow endpoint can delay the worker by up to `timeout` seconds.
+A failing webhook never affects job execution: send errors (unreachable endpoint, timeout,
+HTTP error) are logged and swallowed. Sending is blocking, so a slow endpoint can delay the
+worker by up to `timeout` seconds.
+
+### Reliable Delivery and Retries
+
+_New in version 3.0._
+
+Terminal notifications are durable rather than fire-and-forget. When a job reaches a terminal
+state, a delivery record for each matching webhook is persisted in Redis **in the same
+transaction** as the terminal job state:
+
+* The first send is attempted immediately, as before.
+* On success the record is marked `delivered` (kept for 1 day for auditing) and is never sent again.
+* On failure the record stays `pending` with exponential backoff (30s, 60m cap) and is retried
+  until the endpoint recovers. Pending records are kept for up to 3 days; a delivery that still
+  fails after that is marked `dead` and logged.
+
+Workers reconcile due pending deliveries automatically (shortly after startup and roughly once
+per minute while running). Retries only touch the `rq:webhook:*` keys, so queued or running
+jobs are never affected. If a worker process crashes, the pending records remain in Redis: the
+next worker startup (or a manual run) converges them. For worker-less deployments (synchronous
+queues) or one-off backfills, trigger a pass yourself:
+
+```bash
+rq reconcile-webhooks             # one pass
+rq reconcile-webhooks --interval 60  # keep reconciling every 60s
+```
+
+```python
+from rq import reconcile_pending_webhooks
+reconcile_pending_webhooks(redis_connection)
+```
+
+Because retries can theoretically overlap with an in-flight send (e.g. a crash right after the
+endpoint received the request but before it was marked delivered), every request carries an
+`Idempotency-Key` header that uniquely identifies the delivery
+(`{job_id}:{status}:{webhook_index}:{ended_at}`). Endpoints that need strict exactly-once
+semantics should dedupe on this header. The `POST` payload is snapshotted when the delivery is
+created, so notifications are still retried after the job itself has expired.
 
 
 ## Working with Queues
