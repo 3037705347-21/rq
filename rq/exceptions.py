@@ -69,3 +69,24 @@ class StopRequested(Exception):
     """Raised inside a worker to stop its work loop, e.g. after a stop signal or
     when the worker is suspended in burst mode.
     """
+
+
+class QueueMigrationError(Exception):
+    """Base class for errors raised by ``migrate_queues()``."""
+
+
+class InvalidQueueMappingError(QueueMigrationError):
+    """Raised when a queue migration mapping is missing or unreasonable,
+    e.g. empty, mapping a queue to itself, or using a queue name as both a
+    source and a target (chained/ambiguous rename).
+    """
+
+
+class QueueMigrationConflictError(QueueMigrationError):
+    """Raised when one or more migration target queues already hold pending jobs.
+    The entire migration is aborted before any job is moved.
+    """
+
+
+class QueueMigrationInProgressError(QueueMigrationError):
+    """Raised when another queue migration is currently running."""
