@@ -7,12 +7,16 @@ from rq.executions import prepare_execution
 from rq.job import Job, Retry
 from rq.queue import Queue
 from rq.registry import StartedJobRegistry
-from rq.results import Result, get_key
+from rq.results import Result, ResultConsumer, ResultStreamGapError, get_key
 from rq.utils import now
 from rq.worker import Worker
 from tests import RQTestCase, min_redis_version
 
 from .fixtures import div_by_zero, say_hello
+
+
+def add_result(job, value):
+    return Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=value)
 
 
 @min_redis_version((5, 0, 0))
@@ -332,3 +336,275 @@ class TestResult(RQTestCase):
         Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=2)
         result_blocking = Result.fetch_latest(job, timeout=1)
         self.assertEqual(result_blocking.return_value, 2)
+
+
+@min_redis_version((5, 0, 0))
+class TestResultConsumer(RQTestCase):
+    def create_job(self):
+        queue = Queue(connection=self.connection)
+        return queue.enqueue(say_hello)
+
+    def test_requires_name(self):
+        """Consumer name must be a non-empty string"""
+        job = self.create_job()
+        with self.assertRaises(ValueError):
+            ResultConsumer(job, '')
+        with self.assertRaises(ValueError):
+            ResultConsumer(job, None)
+
+    def test_new_consumer_reads_from_beginning(self):
+        """Consumer without a checkpoint reads all existing results, oldest first"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        self.assertIsNone(consumer.position())
+        results = consumer.read()
+        self.assertEqual(results, [result_1, result_2])
+        # Reading must not advance the checkpoint.
+        self.assertIsNone(consumer.position())
+
+    def test_read_empty_stream(self):
+        """Reading a stream with no results returns an empty list"""
+        job = self.create_job()
+        consumer = ResultConsumer(job, 'alice')
+        self.assertEqual(consumer.read(), [])
+
+    def test_incremental_read_with_count_and_ack(self):
+        """After ack, only newer results are delivered, in batches if requested"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        batch = consumer.read(count=1)
+        self.assertEqual(batch, [result_1])
+        self.assertEqual(consumer.ack(), result_1.id)
+        self.assertEqual(consumer.position(), result_1.id)
+
+        batch = consumer.read(count=1)
+        self.assertEqual(batch, [result_2])
+        consumer.ack()
+
+        # Everything processed: nothing new, and a second read delivers nothing.
+        self.assertEqual(consumer.read(), [])
+        add_result(job, 3)
+        self.assertEqual(len(consumer.read()), 1)
+
+    def test_checkpoint_survives_consumer_restart(self):
+        """A new consumer instance with the same name resumes at the checkpoint"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        self.assertEqual(len(consumer.read(count=1)), 1)
+        consumer.ack()
+
+        # Simulate a process restart: brand new instance, same consumer name.
+        restarted = ResultConsumer(job, 'alice')
+        self.assertEqual(restarted.position(), result_1.id)
+        results = restarted.read()
+        self.assertEqual([result.return_value for result in results], [2])
+
+    def test_consumers_are_independent(self):
+        """Checkpoints of different consumers never affect each other"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        alice = ResultConsumer(job, 'alice')
+        bob = ResultConsumer(job, 'bob')
+
+        self.assertEqual(alice.read(), [result_1, result_2])
+        alice.ack(result_2.id)
+        self.assertEqual(alice.read(), [])
+
+        # Bob has no checkpoint and still sees everything.
+        self.assertEqual(bob.read(), [result_1, result_2])
+        bob.ack(result_1.id)
+
+        # Alice stays at the tip regardless of Bob's move.
+        self.assertEqual(alice.position(), result_2.id)
+        self.assertEqual(bob.position(), result_1.id)
+        self.assertEqual(bob.read(), [result_2])
+
+    def test_failure_before_ack_redelivers_and_converges(self):
+        """Crash/failure before ack redelivers; reprocessing converges to one checkpoint"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        self.assertEqual(consumer.read(), [result_1, result_2])
+        # Processing fails / process dies: no ack() happened.
+        self.assertIsNone(consumer.position())
+
+        # Restart and reprocess the exact same batch.
+        restarted = ResultConsumer(job, 'alice')
+        redelivered = restarted.read()
+        self.assertEqual(redelivered, [result_1, result_2])
+        restarted.ack(result_2.id)
+
+        self.assertEqual(restarted.position(), result_2.id)
+        self.assertEqual(restarted.read(), [])
+        # Acking the same position again is a harmless no-op convergence.
+        restarted.ack(result_2.id)
+        self.assertEqual(restarted.position(), result_2.id)
+
+    def test_ack_validation(self):
+        """ack needs processed results and can never move the checkpoint backwards"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        with self.assertRaises(ValueError):
+            consumer.ack()
+
+        consumer.read()
+        consumer.ack(result_2.id)
+        with self.assertRaises(ValueError):
+            consumer.ack(result_1.id)
+
+    def test_seek_moves_checkpoint_forward(self):
+        """seek() explicitly jumps over results (gap recovery), never backwards"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        result_2 = add_result(job, 2)
+
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read()
+        consumer.seek(result_1.id)
+        self.assertEqual(consumer.position(), result_1.id)
+        self.assertEqual(consumer.read(), [result_2])
+
+        consumer.seek(result_2.id)
+        self.assertEqual(consumer.read(), [])
+        with self.assertRaises(ValueError):
+            consumer.seek(result_1.id)
+
+    def test_gap_raised_when_entries_trimmed(self):
+        """Trimmed entries past the checkpoint raise instead of being skipped"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read(count=1)
+        consumer.ack()
+
+        # Retention trims the acknowledged entry; a new, undelivered entry remains.
+        stream_key = get_key(job.id)
+        surviving_id = self.connection.xadd(stream_key, {'type': '1'}, maxlen=1, approximate=False).decode()
+        self.assertNotEqual(surviving_id, result_1.id)
+
+        with self.assertRaises(ResultStreamGapError) as ctx:
+            consumer.read()
+        gap = ctx.exception
+        self.assertEqual(gap.last_id, result_1.id)
+        self.assertEqual(gap.first_available_id, surviving_id)
+        # Failed gap check must not touch the checkpoint.
+        self.assertEqual(consumer.position(), result_1.id)
+
+        # A consumer without a checkpoint sees no gap (nothing promised yet).
+        newcomer = ResultConsumer(job, 'newcomer')
+        self.assertEqual([r.id for r in newcomer.read()], [surviving_id])
+
+        # Explicit recovery: reset replays from the oldest surviving entry.
+        consumer.reset()
+        self.assertIsNone(consumer.position())
+        self.assertEqual([r.id for r in consumer.read()], [surviving_id])
+
+    def test_gap_recovery_with_seek(self):
+        """seek() to the first surviving entry resumes past the gap"""
+        job = self.create_job()
+        add_result(job, 1)
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read(count=1)
+        consumer.ack()
+
+        stream_key = get_key(job.id)
+        surviving_id = self.connection.xadd(stream_key, {'type': '1'}, maxlen=1, approximate=False).decode()
+        with self.assertRaises(ResultStreamGapError):
+            consumer.read()
+
+        consumer.seek(surviving_id)
+        self.assertEqual(consumer.position(), surviving_id)
+        self.assertEqual(consumer.read(), [])
+
+    def test_gap_raised_when_stream_recreated(self):
+        """A stream deleted/expired after the checkpoint and recreated is a gap"""
+        job = self.create_job()
+        result_1 = add_result(job, 1)
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read(count=1)
+        consumer.ack()
+
+        stream_key = get_key(job.id)
+        self.connection.delete(stream_key)
+        # New entries use a strictly greater (explicit) stream ID.
+        milliseconds = int(result_1.id.split('-')[0])
+        recreated_id = f'{milliseconds + 10}-0'
+        self.connection.xadd(stream_key, {'type': '1'}, id=recreated_id)
+
+        with self.assertRaises(ResultStreamGapError) as ctx:
+            consumer.read()
+        self.assertEqual(ctx.exception.last_id, result_1.id)
+        self.assertEqual(ctx.exception.first_available_id, recreated_id)
+
+    def test_blocking_read(self):
+        """block waits for new results up to a timeout"""
+        job = self.create_job()
+        consumer = ResultConsumer(job, 'alice')
+
+        started_at = time.time()
+        self.assertEqual(consumer.read(block=1), [])
+        self.assertGreaterEqual(time.time() - started_at, 1)
+
+        result_1 = add_result(job, 1)
+        started_at = time.time()
+        results = consumer.read(block=2)
+        self.assertEqual(results, [result_1])
+        self.assertLess(time.time() - started_at, 1)
+
+    def test_checkpoint_ttl_mirrors_stream(self):
+        """Checkpoint keys inherit the stream TTL and persist when the stream persists"""
+        job = self.create_job()
+        add_result(job, 1)
+        positions_key = ResultConsumer.get_key(job.id)
+
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read()
+        consumer.ack()
+        self.assertTrue(0 < self.connection.pttl(positions_key) <= 10000)
+
+        # A stream kept forever keeps its checkpoints forever too.
+        Result.create(job, Result.Type.SUCCESSFUL, ttl=-1, return_value=2)
+        persistent = ResultConsumer(job, 'bob')
+        persistent.read()
+        persistent.ack()
+        self.assertEqual(self.connection.pttl(positions_key), -1)
+
+    def test_delete_all_removes_checkpoints(self):
+        """Result.delete_all() also removes consumer positions"""
+        job = self.create_job()
+        add_result(job, 1)
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read()
+        consumer.ack()
+
+        Result.delete_all(job)
+        self.assertFalse(self.connection.exists(ResultConsumer.get_key(job.id)))
+        self.assertIsNone(ResultConsumer(job, 'alice').position())
+
+    def test_job_delete_removes_checkpoints(self):
+        """Job.delete() also removes consumer positions"""
+        job = self.create_job()
+        add_result(job, 1)
+        consumer = ResultConsumer(job, 'alice')
+        consumer.read()
+        consumer.ack()
+
+        job.delete()
+        self.assertFalse(self.connection.exists(ResultConsumer.get_key(job.id)))

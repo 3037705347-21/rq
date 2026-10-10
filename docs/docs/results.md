@@ -79,6 +79,35 @@ You can do the following:
     q.enqueue(foo, result_ttl=0)  # result gets deleted immediately
     q.enqueue(foo, result_ttl=-1)  # result never expires--you should delete jobs manually
 
+## Incremental Result Consumers
+_New in version 2.12.0._
+
+Results are appended to a Redis stream. A `ResultConsumer` lets a named
+downstream consumer read that stream incrementally with a durable checkpoint,
+so a restarted process resumes after the last result it processed instead of
+re-reading everything. Each consumer name keeps an independent position.
+
+`read()` returns results newer than the checkpoint but does not advance it;
+call `ack()` only after the batch was processed successfully. If processing
+fails or the process dies before `ack()`, the same results are redelivered on
+the next `read()` (at-least-once delivery).
+
+```python
+from rq.results import ResultConsumer
+
+consumer = ResultConsumer(job, name='billing-sync')
+while True:
+    for result in consumer.read(block=5):
+        process(result)        # your logic; raise on failure and nothing is acked
+        consumer.ack(result.id)
+```
+
+If results are trimmed away (RQ keeps the 10 most recent) or expire after the
+consumer's checkpoint, `read()` raises a `ResultStreamGapError` naming the last
+processed ID and the oldest ID still available — the gap is never skipped
+silently. Recover explicitly with `consumer.reset()` to replay from the oldest
+surviving result, or `consumer.seek(result_id)` to jump forward.
+
 ## Asking RQ to Retry
 _New in version 2.1.0._
 

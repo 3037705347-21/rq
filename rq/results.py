@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from redis import Redis
+from redis.exceptions import ResponseError
 
 from .defaults import UNSERIALIZABLE_RETURN_VALUE_PAYLOAD
 from .job import Job
@@ -16,6 +17,34 @@ from .utils import decode_redis_hash, now
 
 def get_key(job_id):
     return f'rq:results:{job_id}'
+
+
+def stream_id_to_tuple(stream_id: str) -> tuple[int, int]:
+    """Convert a Redis stream ID ("<ms>-<seq>") into a comparable tuple."""
+    milliseconds, sequence = stream_id.split('-', 1)
+    return int(milliseconds), int(sequence)
+
+
+class ResultStreamGapError(Exception):
+    """Raised when entries after a consumer's checkpoint are no longer in the stream.
+
+    The result stream was trimmed (MAXLEN retention) or expired between the
+    consumer's last acknowledged position and the oldest entry that is still
+    available. The gap is reported instead of being silently skipped.
+
+    Recover explicitly with ResultConsumer.reset() (replay from the oldest
+    surviving entry) or ResultConsumer.seek() (jump to a surviving entry).
+    """
+
+    def __init__(self, consumer: str, last_id: str, first_available_id: str):
+        self.consumer = consumer
+        self.last_id = last_id
+        self.first_available_id = first_available_id
+        super().__init__(
+            f'Result stream gap detected for consumer {consumer!r}: entries after '
+            f'{last_id} were trimmed or expired, oldest available entry is '
+            f'{first_available_id}. Use ResultConsumer.reset() or seek() to recover.'
+        )
 
 
 class Result:
@@ -189,8 +218,8 @@ class Result:
 
     @classmethod
     def delete_all(cls, job: Job) -> None:
-        """Delete all job results"""
-        job.connection.delete(cls.get_key(job.id))
+        """Delete all job results and consumer checkpoints"""
+        job.connection.delete(cls.get_key(job.id), ResultConsumer.get_key(job.id))
 
     @classmethod
     def restore(cls, job_id: str, result_id: str, payload: dict, connection: Redis, serializer=None) -> Result:
@@ -323,3 +352,184 @@ class Result:
 
         # return json.dumps(data)
         return data
+
+
+class ResultConsumer:
+    """Incrementally reads a job's result stream with a durable per-consumer position.
+
+    Each named consumer owns an independent checkpoint (the ID of the last
+    successfully processed result), stored in a Redis hash. Delivery is
+    at-least-once: :meth:`read` returns entries strictly newer than the
+    checkpoint without advancing it, and :meth:`ack` persists progress only
+    after processing succeeded. If processing fails or the process dies
+    before ``ack()``, the same entries are redelivered on the next ``read()``;
+    reprocessing the same batch converges to the same checkpoint. Checkpoints
+    of different consumer names never affect each other.
+
+    If retention (MAXLEN trimming or stream expiry) removed entries past the
+    checkpoint, :meth:`read` raises :class:`ResultStreamGapError` rather than
+    silently skipping them. Recover with :meth:`reset` (replay oldest
+    surviving entries) or :meth:`seek` (jump to a surviving entry).
+    """
+
+    def __init__(self, job: Job, name: str, connection: Redis | None = None, serializer=None):
+        if not isinstance(name, str) or not name:
+            raise ValueError('ResultConsumer name must be a non-empty string')
+        self.job = job
+        self.job_id = job.id
+        self.name = name
+        self.connection = connection if connection is not None else job.connection
+        self.serializer = resolve_serializer(serializer if serializer is not None else job.serializer)
+        # ID of the last entry returned by read(); used by ack() without args.
+        self._last_read_id: str | None = None
+
+    def __repr__(self):
+        return f'ResultConsumer(job_id={self.job_id}, name={self.name!r})'
+
+    @classmethod
+    def get_key(cls, job_id):
+        """Redis hash mapping consumer names to their last acknowledged stream ID."""
+        return f'rq:results:{job_id}:positions'
+
+    @property
+    def stream_key(self) -> str:
+        return Result.get_key(self.job_id)
+
+    @property
+    def positions_key(self) -> str:
+        return self.get_key(self.job_id)
+
+    def position(self) -> str | None:
+        """Last acknowledged stream ID for this consumer, or None if unregistered."""
+        raw = self.connection.hget(self.positions_key, self.name)
+        return raw.decode() if raw is not None else None
+
+    def read(self, count: int | None = None, block: int = 0) -> list[Result]:
+        """Read results newer than this consumer's checkpoint.
+
+        The checkpoint is not advanced; call :meth:`ack` after the returned
+        results have been processed successfully.
+
+        Args:
+            count: Maximum number of results to return.
+            block: Seconds to block waiting for new results. 0 (the default)
+                returns immediately when there is nothing new.
+
+        Returns:
+            Results in append order, oldest first; empty list when up to date.
+
+        Raises:
+            ResultStreamGapError: Entries after the checkpoint were trimmed
+                or expired and can no longer be delivered.
+        """
+        position = self.position()
+        # A consumer without a checkpoint starts at the beginning of the stream.
+        start_id = position if position is not None else '0-0'
+        if start_id != '0-0':
+            self._raise_if_gap(start_id)
+
+        read_kwargs: dict[str, Any] = {}
+        if count is not None:
+            read_kwargs['count'] = count
+        if block:
+            # XREAD block timeout is in milliseconds.
+            read_kwargs['block'] = int(block * 1000)
+
+        try:
+            response = self.connection.xread({self.stream_key: start_id}, **read_kwargs)
+        except ResponseError:
+            # Some Redis versions/forks reject XREAD from an ID below the
+            # stream minimum instead of silently returning the new head.
+            self._raise_if_gap(start_id)
+            raise
+
+        results: list[Result] = []
+        if response:
+            entries = response[0][1]  # Single stream queried: (key, entries).
+            for result_id, payload in entries:
+                results.append(
+                    Result.restore(
+                        self.job_id,
+                        result_id.decode(),
+                        payload,
+                        connection=self.connection,
+                        serializer=self.serializer,
+                    )
+                )
+            if results:
+                self._last_read_id = results[-1].id
+        return results
+
+    def ack(self, result_id: str | None = None) -> str:
+        """Persist progress after results were processed successfully.
+
+        Args:
+            result_id: Stream ID to acknowledge. Defaults to the last ID
+                returned by :meth:`read` on this instance.
+
+        Returns:
+            The acknowledged stream ID.
+
+        Raises:
+            ValueError: Nothing to acknowledge, or moving the checkpoint
+                backwards is attempted.
+        """
+        if result_id is None:
+            result_id = self._last_read_id
+        if result_id is None:
+            raise ValueError('Nothing to acknowledge; process results from read() first')
+        if isinstance(result_id, bytes):
+            result_id = result_id.decode()
+        self._advance(result_id)
+        return result_id
+
+    def seek(self, result_id: str) -> str:
+        """Explicitly move the checkpoint to ``result_id`` (gap recovery).
+
+        The next :meth:`read` returns entries strictly newer than ``result_id``.
+        Moving backwards is rejected; use :meth:`reset` to replay from the
+        oldest surviving entry.
+        """
+        if isinstance(result_id, bytes):
+            result_id = result_id.decode()
+        self._advance(result_id)
+        return result_id
+
+    def reset(self) -> None:
+        """Forget the checkpoint, accepting any gap and replaying from the
+        oldest surviving entry on the next :meth:`read`."""
+        self.connection.hdel(self.positions_key, self.name)
+        self._last_read_id = None
+
+    def _raise_if_gap(self, position: str) -> None:
+        """Raise if entries strictly between position and the stream head are gone."""
+        # Stream does not exist yet (or fully expired): nothing to compare.
+        # If it is recreated later with newer IDs, the comparison below catches it.
+        if not self.connection.exists(self.stream_key):
+            return
+        first_entry = self.connection.xinfo_stream(self.stream_key).get('first-entry')
+        if first_entry is None:
+            return
+        first_id = first_entry[0]
+        if isinstance(first_id, bytes):
+            first_id = first_id.decode()
+        if stream_id_to_tuple(position) < stream_id_to_tuple(first_id):
+            raise ResultStreamGapError(self.name, position, first_id)
+
+    def _advance(self, result_id: str) -> None:
+        """Persist a strictly monotonic checkpoint, mirroring stream TTL."""
+        current = self.position()
+        if current is not None and stream_id_to_tuple(current) > stream_id_to_tuple(result_id):
+            raise ValueError(
+                f'Cannot move consumer {self.name!r} backwards: checkpoint is at '
+                f'{current}, refusing to record {result_id}'
+            )
+        pipeline = self.connection.pipeline()
+        pipeline.hset(self.positions_key, self.name, result_id)
+        # Keep the checkpoints alive as long as the stream they point into.
+        ttl = self.connection.pttl(self.stream_key)
+        if ttl > 0:
+            pipeline.pexpire(self.positions_key, ttl)
+        elif ttl == -1:
+            pipeline.persist(self.positions_key)
+        pipeline.execute()

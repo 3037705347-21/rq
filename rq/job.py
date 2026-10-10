@@ -1409,7 +1409,7 @@ class Job:
             remove_from_queue (bool, optional): Whether the job should be removed from the queue. Defaults to True.
             delete_dependents (bool, optional): Whether job dependents should also be deleted. Defaults to False.
         """
-        from .results import Result
+        from .results import Result, ResultConsumer
 
         connection = pipeline if pipeline is not None else self.connection
 
@@ -1424,7 +1424,13 @@ class Job:
             group = Group.fetch(self.group_id, self.connection)
             group.delete_job(self.id, pipeline=pipeline)
 
-        connection.delete(self.key, self.dependents_key, self.dependencies_key, Result.get_key(self.id))
+        connection.delete(
+            self.key,
+            self.dependents_key,
+            self.dependencies_key,
+            Result.get_key(self.id),
+            ResultConsumer.get_key(self.id),
+        )
 
         if self.has_rate_limit:
             from .rate_limit import RateLimitRegistry
